@@ -1,0 +1,353 @@
+#!/bin/bash
+
+set -x
+# make sure your packages be ready under the directory same with this script.
+# SWR DBM PSM AOS BootstrapCFE CAM keepalived haproxy
+
+# TODO
+# delete blueprints and charts(install AOS by CFE instead of CAM)
+serviceName=FusionStage-CoreBase-
+PackageVersion=000.`date '+%y %m%d%H%M'|awk '{print $1}'`.`date '+%y %m%d%H%M'|awk '{print $2}'`
+
+# add by mmzhou
+releaseVersion=B017
+
+if [ ! $releaseVersion ]; then
+    Version=${PackageVersion}
+    buildType=Snapshot
+else
+	releaseVersion=$(echo $releaseVersion | tr '[a-z]' '[A-Z]')
+    if echo $releaseVersion | grep -iqe '^B' ;then 
+        echo 'grep iqe B is true'
+        releaseVersion=${releaseVersion#*B};
+    fi
+    Version=$releaseVersion
+    buildType=Release
+fi
+
+
+solution_name_ver=${serviceName}${Version}
+dstPOMDir=/var/paas/baseFsV2R2Pkg/CoreBase/${buildType}
+
+
+pkgFromCIDir=/var/paas/corebase_pkgs_from_CI
+pkg_script_dir=/var/paas/corebase_CI_scripts
+
+BootstrapPackages=(AOS BootstrapCFE CAM DBM haproxy MySQL keepalived PSM POM PAP Redis RTSP SWR)
+
+rm -rf   ${WORKSPACE}/svc ${WORKSPACE}/solution ${WORKSPACE}/tmpDir
+mkdir -p ${WORKSPACE}/svc ${WORKSPACE}/solution ${WORKSPACE}/tmpDir
+
+# step 1. cp packages into svc dir.
+
+# step 1. get all related packages
+if [ $releaseVersion ]; then
+  for pkg in "${BootstrapPackages[@]}"
+  do
+    wget -r -l 1 -np -nd --accept="${pkg}-*" http://10.120.195.215:9094/FusionStageArchive_V2R2_B${releaseVersion}/ -P ${WORKSPACE}/svc 2>/dev/null
+    if [ ! -f ${WORKSPACE}/svc/${pkg}* ]; then
+    	echo ERROR: ${pkg} not found.
+        exit 1
+    fi
+    cnt=`ls -lh  ${WORKSPACE}/svc | grep ${pkg} | wc -l`
+    if [ $cnt -ne 1 ]; then
+        echo ERROR: ${pkg} count does not equal 1.
+        exit 1
+    fi
+  done
+else   
+  # when doing Continues Intergration   >>>>>>>>
+  cd ${WORKSPACE}
+  rm -rf ${pkgFromCIDir}/*
+  mkdir -p CI_Scripts/
+  rm -rf CI_Scripts/*
+  cp -r ${pkg_script_dir}/* CI_Scripts/
+  
+  cd CI_Scripts
+  
+  for pkg in "${BootstrapPackages[@]}"
+  do
+    bash -x Pk_download_func.sh $pkg ${pkgFromCIDir}/
+    if [ $? != 0 ]; then
+      echo download $pkg failed.
+      exit 1
+    fi
+  done
+  
+  for pkg in "${BootstrapPackages[@]}"
+  do
+    cnt=`ls -lh  ${pkgFromCIDir}/${pkg}* | wc -l`
+    if [[ $cnt -ne 1 ]] && [[  $pkg != "POM" ]]; then
+      echo package count of ${pkg} is not only 1.
+      exit 1
+    fi
+  done
+  
+  cp ${pkgFromCIDir}/* ${WORKSPACE}/svc
+  
+fi
+
+
+# step 2. create dirs for solution
+solutionDirs=(images charts blueprints bootstrap packages)
+for dir in "${solutionDirs[@]}"
+do
+  mkdir -p ${WORKSPACE}/solution/${dir}
+done
+
+
+# add by mmzhou
+cp /home/paas/POM-1.0.1.zip ${WORKSPACE}/svc/POM-1.0.1.zip
+# step 3. unzip and update images/blueprints/charts/packages.
+unzip ${WORKSPACE}/svc/POM-*.zip -d ${WORKSPACE}/solution/bootstrap
+rm -rf ${WORKSPACE}/svc/POM-*.zip
+
+mv ${WORKSPACE}/svc/BootstrapCFE* ${WORKSPACE}/solution/bootstrap/package
+mv ${WORKSPACE}/svc/PAP* ${WORKSPACE}/solution/bootstrap/package
+
+unzip -o ${WORKSPACE}/svc/DBM*.zip   -d ${WORKSPACE}/solution/bootstrap/swr
+unzip -o ${WORKSPACE}/svc/Redis*.zip -d ${WORKSPACE}/solution/bootstrap/swr
+unzip -o ${WORKSPACE}/svc/RTSP*.zip  -d ${WORKSPACE}/solution/bootstrap/swr
+unzip -o ${WORKSPACE}/svc/MySQL*.zip -d ${WORKSPACE}/solution/bootstrap/swr
+
+# bug fix for DBM dbagent
+rm -rf ${WORKSPACE}/solution/bootstrap/swr/packages/metadata.yaml
+
+cp ${WORKSPACE}/solution/bootstrap/swr/packages/DBMBootstrap*.tgz ${WORKSPACE}/solution/bootstrap/package
+
+# step 3.1 fetch dependent tools
+wget http://10.120.195.215:6066/tools/docker_load -P ${WORKSPACE}/solution/bootstrap/bin --no-proxy 2>/dev/null
+chmod +x ${WORKSPACE}/solution/bootstrap/bin/*
+wget -r -l 1 -np -nd --accept="*tar.gz" http://10.120.195.215:6066/lib -P ${WORKSPACE}/solution/bootstrap/images/lib --no-proxy  2>/dev/null  # lib dir
+wget -r -l 1 -np -nd --accept="*tar.gz" http://10.120.195.215:6066/base  -P ${WORKSPACE}/solution/bootstrap/images/base --no-proxy   2>/dev/null # base dir
+wget http://10.120.195.215:6066/baseImages/euleros-2.2.tar   -P ${WORKSPACE}/solution/bootstrap/images --no-proxy  2>/dev/null
+#确认是否要加
+wget http://10.162.222.209:8888/component/bin/fio   -P ${WORKSPACE}/solution/bootstrap/bin --no-proxy  2>/dev/null
+
+wget http://10.162.197.72:8090/CI_config/common/ca.cer                -P ${WORKSPACE}/solution/bootstrap/cert    --no-proxy 2>/dev/null
+wget http://10.162.197.72:8090/CI_config/common/ca_key_decrypt.pem    -P ${WORKSPACE}/solution/bootstrap/cert    --no-proxy 2>/dev/null
+wget http://10.162.197.72:8090/CI_config/common/root.key              -P ${WORKSPACE}/solution/bootstrap/userkey --no-proxy 2>/dev/null
+wget http://10.162.197.72:8090/CI_config/common/common_shared.key     -P ${WORKSPACE}/solution/bootstrap/userkey --no-proxy 2>/dev/null
+wget http://10.162.197.72:8090/CI_config/common/redis_shared.key      -P ${WORKSPACE}/solution/bootstrap/userkey --no-proxy 2>/dev/null
+
+services=`ls ${WORKSPACE}/svc | grep ".zip$"`
+
+for service in ${services}
+do
+  service_name=`echo ${service} | sed 's/.zip$//g' | awk -F "-" '{print $1}'`
+  unzip -qo ${WORKSPACE}/svc/${service} -d ${WORKSPACE}/tmpDir/${service_name}
+  for pkg in "${BootstrapPackages[@]}"
+  do
+    if [[ ${pkg} = ${service_name} ]]; then
+      mv ${WORKSPACE}/svc/${service} ${WORKSPACE}/solution/bootstrap/package
+      dir_name=`echo ${service} |  sed 's/.zip$//g'`
+      unzip ${WORKSPACE}/solution/bootstrap/package/${service} -d ${WORKSPACE}/solution/bootstrap/package/${dir_name}
+
+      if [[ ${pkg} = "DBM" ]] ; then
+        rm -rf ${WORKSPACE}/solution/bootstrap/package/${dir_name}/packages
+      fi
+
+      cd ${WORKSPACE}/solution/bootstrap/package/${dir_name}/images
+      rm -rf ${WORKSPACE}/solution/bootstrap/package/${dir_name}/images/images.list
+      ls | grep -v images.list >> images.list
+      ls | grep -v images.list | xargs rm -rf
+      rm -rf ${WORKSPACE}/solution/bootstrap/package/${service}
+      cd ${WORKSPACE}/solution/bootstrap/package/${dir_name}
+      zip -qr ../${service} *
+      rm -rf ${WORKSPACE}/solution/bootstrap/package/${dir_name}
+    fi
+
+    if [[ ${pkg} = ${service_name} ]] && [[  $pkg = "DBM" ]]; then
+      rm -rf ${WORKSPACE}/tmpDir/${service_name}/images/*.tar
+    fi
+  done
+
+
+  rm -rf ${WORKSPACE}/svc/${service}
+  
+  tempDirList=`ls ${WORKSPACE}/tmpDir/${service_name} | xargs`
+  for dir in "${tempDirList[@]}"
+  do
+    if [ -d ${WORKSPACE}/tmpDir/${service_name}/images ] && [ $service_name != "DBM" ] && [ $service_name != "Redis" ] && [ $service_name != "RTSP" ] && [ $service_name != "MySQL" ]; then
+      cnt=`ls -lh  ${WORKSPACE}/tmpDir/${service_name}/images | grep ".tar$" | wc -l`
+      if [ $cnt -ge 1 ]; then
+        mv ${WORKSPACE}/tmpDir/${service_name}/images/*.tar ${WORKSPACE}/solution/images
+      else
+        echo Notice: no tar file in package ${service}
+      fi
+      
+      cnt=`ls ${WORKSPACE}/tmpDir/${service_name}/images | grep -v ".tar$" | wc -l`
+      if [ $cnt -ge 1 ]; then
+        imgDirs=`ls ${WORKSPACE}/tmpDir/${service_name}/images | grep -v ".tar$"`
+        for imgDir in ${imgDirs}
+        do
+          if [ -d ${WORKSPACE}/tmpDir/${service_name}/images/${imgDir} ]; then
+            rm -rf ${WORKSPACE}/solution/images/${imgDir}
+            mv ${WORKSPACE}/tmpDir/${service_name}/images/${imgDir} ${WORKSPACE}/solution/images
+          fi
+        done
+      fi
+      
+    else
+      echo "images not found for ${service_name}"
+    fi
+    
+    if [ -d ${WORKSPACE}/tmpDir/${service_name}/charts ] && [ $service_name != "DBM" ] && [ $service_name != "Redis" ] && [ $service_name != "RTSP" ] && [ $service_name != "MySQL" ]; then
+      cnt=`ls -lh  ${WORKSPACE}/tmpDir/${service_name}/charts |grep ".tgz$" | wc -l`
+      if [ $cnt -ge 1 ]; then
+        mv ${WORKSPACE}/tmpDir/${service_name}/charts/*.tgz ${WORKSPACE}/solution/charts
+      fi
+    else
+      echo "charts not found for ${service_name}"
+    fi
+    
+    if [ -d ${WORKSPACE}/tmpDir/${service_name}/blueprints ]; then
+      mkdir -p ${WORKSPACE}/solution/blueprints/${service_name}
+      
+      cnt=`ls -lh  ${WORKSPACE}/tmpDir/${service_name}/blueprints | grep .zip | wc -l`
+      if [ $cnt -ge 1 ]; then
+        unzip -o ${WORKSPACE}/tmpDir/${service_name}/blueprints/*.zip -d ${WORKSPACE}/solution/blueprints/${service_name}
+      fi
+      
+      cnt=`ls -lh  ${WORKSPACE}/tmpDir/${service_name}/blueprints | grep .yaml | wc -l`
+      if [ $cnt -ge 1 ]; then
+        mv ${WORKSPACE}/tmpDir/${service_name}/blueprints/*.yaml ${WORKSPACE}/solution/blueprints/${service_name}
+      fi
+    else
+      echo "blueprints not found for ${service_name}"
+    fi
+    
+    if [ -d ${WORKSPACE}/tmpDir/${service_name}/packages ] && [ $service_name != "DBM" ] && [ $service_name != "Redis" ] && [ $service_name != "RTSP" ] && [ $service_name != "MySQL" ]; then
+      mv ${WORKSPACE}/tmpDir/${service_name}/packages/* ${WORKSPACE}/solution/packages
+    fi
+  done
+
+done
+
+if [ -d ${WORKSPACE}/solution/bootstrap/swr ]; then
+  cp -rf ${WORKSPACE}/solution/bootstrap/swr/images/* ${WORKSPACE}/solution/images
+  rm -rf ${WORKSPACE}/solution/bootstrap/swr/images/*
+fi
+
+#sh ${WORKSPACE}/rebuildCFE.sh ${WORKSPACE}/solution/bootstrap/package
+REBUILD_PATH=${WORKSPACE}/solution/bootstrap/package
+
+pkg_name=`echo ${REBUILD_PATH}/BootstrapCFE*`
+pkg_name=`echo ${pkg_name##*/}`
+service_name=`echo ${pkg_name} |  sed 's/.zip$//g'`
+
+unzip -q ${REBUILD_PATH}/BootstrapCFE-*.zip -d ${REBUILD_PATH}/${service_name}
+cd ${REBUILD_PATH}/${service_name}
+
+services=`ls | grep ".zip$"`
+for service in ${services};
+do
+  zip_name=`echo ${service} | sed 's/.zip$//g'`
+  unzip -qo ${service} -d ${zip_name}
+  if [ ! -d ${zip_name}/images ]; then rm -rf ${zip_name};continue; fi
+  rm -rf ${service}
+  cd ${zip_name}/images
+  cp -rf * ../../../../../images/
+  ls | grep -v images.list > images.list
+  #ls | grep -v images.list | xargs cp -rf ../../../../../images/
+  ls | grep -v images.list | xargs rm -rf
+  cd ../
+  zip -rq ../${zip_name}.zip *
+  cd ../
+  rm -rf ${zip_name}
+done
+
+rm -rf ../${pkg_name}
+zip -rq ../${pkg_name} *
+rm -rf ../${service_name}
+#----------- end rebuildCFE.sh --------------------
+
+# step 4. TODO  裁剪没用的文件
+echo -e "[step 4] replace blueprint"
+rm -rf ${WORKSPACE}/solution/blueprints/*.yaml
+
+mv ${WORKSPACE}/solution/bootstrap/blueprints/* ${WORKSPACE}/solution/blueprints
+rmdir ${WORKSPACE}/solution/bootstrap/blueprints
+
+rm -rf ${WORKSPACE}/solution/blueprints/blueprint-om.yaml
+rm -rf ${WORKSPACE}/solution/blueprints/blueprint-multiaz.yaml
+rm -rf ${WORKSPACE}/solution/blueprints/blueprint.yaml
+wget http://10.162.197.72:8090/CI_config/common/blueprint-om-corebase.yaml -O ${WORKSPACE}/solution/blueprints/blueprint-om.yaml 2>/dev/null
+wget http://10.162.197.72:8090/CI_config/common/blueprint-manage-corebase.yaml -O ${WORKSPACE}/solution/blueprints/blueprint-multiaz.yaml 2>/dev/null
+wget http://10.162.197.72:8090/CI_config/common/blueprint-manage-corebase.yaml -O ${WORKSPACE}/solution/blueprints/blueprint.yaml 2>/dev/null
+
+#rm -rf ${WORKSPACE}/solution/bootstrap/conf/install_om_*.xml
+#rm -rf ${WORKSPACE}/solution/bootstrap/conf/install_tenant_*.xml
+#rm -rf ${WORKSPACE}/solution/bootstrap/conf/default_om_*.conf
+#rm -rf ${WORKSPACE}/solution/bootstrap/conf/default_tenant_*.conf
+
+rm -rf ${WORKSPACE}/solution/blueprints/MySQL
+
+
+if [ -f ${WORKSPACE}/solution/images/images.list ]; then
+    rm -rf ${WORKSPACE}/solution/images/images.list
+fi
+
+if [ ! -d ${dstPOMDir} ]; then
+    mkdir -p ${dstPOMDir}
+fi
+
+# save packages
+if [ -f ${dstPOMDir}/${solution_name_ver}.zip ]; then
+  rm -rf ${dstPOMDir}/${solution_name_ver}.zip
+fi
+
+rm -rf ${dstPOMDir}/../*.zip
+
+cd ${WORKSPACE}/solution
+
+#step 5. modify default rights.
+  # 脚本增加权限不大于750
+find . -name "*.sh" | xargs chmod 750
+#find . -name "*.py" | xargs chmod 750
+  # 配置文件和json文件不大于640
+find . -name "*.conf" | xargs chmod 600
+find . -name "*.json" | xargs chmod 600
+find . -name "*.yaml" | xargs chmod 600
+find . -name "*.xml" | xargs chmod 600
+  # sql语句权限不大于640
+#find . -name "*.sql" | xargs chmod 640
+  # 压缩包文件权限不大于640
+find . -name "*.zip" | xargs chmod 640
+find . -name "*.tar.gz" | xargs chmod 640
+find . -name "*.tgz" | xargs chmod 640
+find . -name "*.tar" | xargs chmod 640
+
+# 特殊脚本文件权限不大于750
+chmod 750 ${WORKSPACE}/solution/bootstrap/bin/*
+chmod 640 ${WORKSPACE}/solution/bootstrap/conf/POM.version
+
+  # 文件夹权限不大于750
+find . -type d | xargs chmod 750
+
+#证书文件夹700
+chmod 700 ${WORKSPACE}/solution/bootstrap/cert ${WORKSPACE}/solution/bootstrap/userkey
+chmod 600 ${WORKSPACE}/solution/bootstrap/cert/* ${WORKSPACE}/solution/bootstrap/userkey/*
+
+# step 6. zip package
+
+zip -r ${dstPOMDir}/${solution_name_ver}.zip ./*
+
+cp ${dstPOMDir}/${solution_name_ver}.zip ${dstPOMDir}/..
+
+echo "Finish !!!"
+
+####################将软件包上传到CloudArtifact 软件仓库####################
+cd ${WORKSPACE}
+fileDir=${dstPOMDir}/${solution_name_ver}.zip
+
+echo "buildType="$buildType>uploadEnv.list
+echo "ServiceName=FsPOM">>uploadEnv.list
+echo "SERVICE_NAME=FsPOM">>uploadEnv.list
+echo "Version="$Version>>uploadEnv.list
+echo "SERVICE_VERSION="$Version>>uploadEnv.list
+echo "isRelease="$isRelease>>uploadEnv.list
+echo "releaseVersion="$releaseVersion>>uploadEnv.list
+echo "RELEASE_VERSION="$releaseVersion>>uploadEnv.list
+echo "fileDir="${fileDir}>>uploadEnv.list
+
