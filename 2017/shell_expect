@@ -1,0 +1,24 @@
+#!/usr/bin/expect -f
+set username [lindex $argv 0] 
+set password [lindex $argv 1] 
+set hostIP [lindex $argv 2]
+set timeout 3600
+set packagename [lindex $argv 3]
+set targetLocalPath [lindex $argv 4]
+spawn scp -r -p ${targetLocalPath} ${username}@${hostIP}:${packagename}
+expect {
+ "(yes/no)?"
+ {
+       send "yes\n"
+         expect "*assword:" { send "$password\n" }
+
+ }
+  "*assword:"
+  {
+        send "$password\n"
+
+  }
+
+ }
+ expect "100%"
+ expect eof
